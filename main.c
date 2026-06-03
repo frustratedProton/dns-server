@@ -1,3 +1,4 @@
+#include <complex.h>
 #include <ctype.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -217,6 +218,124 @@ int dns_header_read(DnsHeader *h, BytePacketBuffer *bfp) {
     return -1;
   if (buffer_read_u16(bfp, &h->resource_entries))
     return -1;
+
+  return 0;
+}
+
+typedef enum {
+  QUERY_UNKNOWN = 0,
+  QUERY_A = 1,
+} QueryTypeKind;
+
+typedef struct {
+  QueryTypeKind kind;
+  uint16_t num;
+} QueryType;
+
+QueryType querytype_from_num(uint16_t num) {
+  QueryType qt;
+  switch (num) {
+  case 1:
+    qt.kind = QUERY_A;
+    qt.num = 1;
+    break;
+  default:
+    qt.kind = QUERY_UNKNOWN;
+    qt.num = 0;
+    break;
+  }
+  return qt;
+}
+
+uint16_t querytype_to_num(QueryType qt) { return qt.num; }
+
+/*
+ * DNSQuestion
+ */
+
+typedef struct {
+  char name[256];
+  QueryType qtype;
+} DnsQuestion;
+
+void dns_question_init(DnsQuestion *q) {
+  memset(q->name, 0, 256);
+  q->qtype = querytype_from_num(0);
+}
+
+int dns_questions_read(DnsQuestion *q, BytePacketBuffer *bfp) {
+  if (buffer_read_qname(bfp, q->name, 256))
+    return -1;
+
+  uint16_t qtype_num;
+  if (buffer_read_u16(bfp, &qtype_num))
+    return -1;
+
+  q->qtype = querytype_from_num(qtype_num);
+
+  uint16_t class;
+  if (buffer_read_u16(bfp, &class))
+    return -1;
+  return 0;
+}
+
+/*
+ * DNS RECORD
+ */
+
+typedef enum { DNS_RECORD_UNKNOWN = 0, DNS_RECORD_A = 1 } DnsRecordKind;
+
+typedef struct {
+  DnsRecordKind kind;
+  char domain[256];
+  uint32_t ttl;
+  uint8_t addr[4];
+  uint16_t qtype;
+  uint16_t data_len;
+} DnsRecord;
+
+int dns_record_read(BytePacketBuffer *bfp, DnsRecord *out) {
+  if (buffer_read_qname(bfp, out->domain, 256))
+    return -1;
+
+  uint16_t qname_type;
+  if (buffer_read_u16(bfp, &qname_type))
+    return -1;
+
+  QueryType qtype = querytype_from_num(qname_type);
+
+  uint16_t class;
+  if (buffer_read_u16(bfp, &class))
+    return -1;
+  if (buffer_read_u32(bfp, &out->ttl))
+    return -1;
+
+  uint16_t data_len;
+  if (buffer_read_u16(bfp, &data_len))
+    return -1;
+
+  switch (qtype.kind) {
+  case QUERY_A: {
+    uint32_t raw_addr;
+    if (buffer_read_u32(bfp, &raw_addr))
+      return -1;
+
+    out->kind = DNS_RECORD_A;
+    out->addr[0] = (raw_addr >> 24) & 0xFF;
+    out->addr[1] = (raw_addr >> 16) & 0xFF;
+    out->addr[2] = (raw_addr >> 8) & 0xFF;
+    out->addr[3] = (raw_addr >> 0) & 0xFF;
+    break;
+  }
+  default:
+    if (buffer_step(bfp, data_len))
+      return -1;
+
+    out->kind = DNS_RECORD_UNKNOWN;
+    out->qtype = qname_type;
+    out->data_len = data_len;
+    break;
+  }
 
   return 0;
 }
