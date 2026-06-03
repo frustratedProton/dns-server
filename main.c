@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define BUFFER_SIZE 512
@@ -159,6 +160,24 @@ ResultCode resultcode_from_num(uint8_t num) {
     return NOERROR;
   }
 }
+static const char *resultcode_to_str(ResultCode rc) {
+  switch (rc) {
+  case NOERROR:
+    return "NOERROR";
+  case FORMERR:
+    return "FORMERR";
+  case SERVFAIL:
+    return "SERVFAIL";
+  case NXDOMAIN:
+    return "NXDOMAIN";
+  case NOTIMP:
+    return "NOTIMP";
+  case REFUSED:
+    return "REFUSED";
+  default:
+    return "UNKNOWN";
+  }
+}
 
 /*
  * DNS HEADER
@@ -231,6 +250,15 @@ typedef struct {
   QueryTypeKind kind;
   uint16_t num;
 } QueryType;
+
+static const char *querytype_to_str(QueryType qt) {
+  switch (qt.kind) {
+  case QUERY_A:
+    return "A";
+  default:
+    return "UNKNOWN";
+  }
+}
 
 QueryType querytype_from_num(uint16_t num) {
   QueryType qt;
@@ -337,5 +365,181 @@ int dns_record_read(BytePacketBuffer *bfp, DnsRecord *out) {
     break;
   }
 
+  return 0;
+}
+
+/*
+ * DNS PACKET
+ */
+
+typedef struct {
+  DnsHeader header;
+  DnsQuestion *questions;
+  DnsRecord *answers;
+  DnsRecord *authorities;
+  DnsRecord *resources;
+} DnsPacket;
+
+void dns_packet_init(DnsPacket *pkt) {
+  dns_header_init(&pkt->header);
+  pkt->questions = NULL;
+  pkt->answers = NULL;
+  pkt->authorities = NULL;
+  pkt->resources = NULL;
+}
+
+void dns_packet_free(DnsPacket *pkt) {
+  free(pkt->questions);
+  free(pkt->answers);
+  free(pkt->authorities);
+  free(pkt->resources);
+}
+
+int dns_packet_from_buffer(BytePacketBuffer *bfp, DnsPacket *pkt) {
+  dns_packet_init(pkt);
+
+  if (dns_header_read(&pkt->header, bfp))
+    return -1;
+
+  pkt->questions = calloc(pkt->header.questions, sizeof(DnsQuestion));
+  for (uint16_t i = 0; i < pkt->header.questions; i++) {
+    dns_question_init(&pkt->questions[i]);
+    if (dns_questions_read(&pkt->questions[i], bfp))
+      return -1;
+  }
+
+  pkt->answers = calloc(pkt->header.answers, sizeof(DnsRecord));
+  for (uint16_t i = 0; i < pkt->header.answers; i++) {
+    if (dns_record_read(bfp, &pkt->answers[i]))
+      return -1;
+  }
+
+  pkt->authorities =
+      calloc(pkt->header.authoritative_entries, sizeof(DnsRecord));
+  for (uint16_t i = 0; i < pkt->header.authoritative_entries; i++) {
+    if (dns_record_read(bfp, &pkt->authorities[i]))
+      return -1;
+  }
+
+  pkt->resources = calloc(pkt->header.resource_entries, sizeof(DnsRecord));
+  for (uint16_t i = 0; i < pkt->header.resource_entries; i++) {
+    if (dns_record_read(bfp, &pkt->resources[i]))
+      return -1;
+  }
+
+  return 0;
+}
+
+int main(void) {
+  FILE *f = fopen("response_packet.txt", "rb");
+  if (!f) {
+    perror("fopen");
+    return 1;
+  }
+
+  BytePacketBuffer buff;
+  buffer_init(&buff);
+  fread(buff.buf, 1, BUFFER_SIZE, f);
+  fclose(f);
+
+  DnsPacket pkt;
+  if (dns_packet_from_buffer(&buff, &pkt)) {
+    fprintf(stderr, "failed to parse packet\n");
+    return 1;
+  }
+
+  /* print header */
+  printf("DnsHeader {\n");
+  printf("    id: %u,\n", pkt.header.id);
+  printf("    recursion_desired: %s,\n",
+         pkt.header.recursion_desired ? "true" : "false");
+  printf("    truncated_message: %s,\n",
+         pkt.header.truncated_message ? "true" : "false");
+  printf("    authoritative_answer: %s,\n",
+         pkt.header.authoritative_answer ? "true" : "false");
+  printf("    opcode: %u,\n", pkt.header.opcode);
+  printf("    response: %s,\n", pkt.header.response ? "true" : "false");
+  printf("    rescode: %s,\n", resultcode_to_str(pkt.header.rescode));
+  printf("    checking_disabled: %s,\n",
+         pkt.header.checking_disabled ? "true" : "false");
+  printf("    authed_data: %s,\n", pkt.header.authed_data ? "true" : "false");
+  printf("    z: %s,\n", pkt.header.z ? "true" : "false");
+  printf("    recursion_available: %s,\n",
+         pkt.header.recursion_available ? "true" : "false");
+  printf("    questions: %u,\n", pkt.header.questions);
+  printf("    answers: %u,\n", pkt.header.answers);
+  printf("    authoritative_entries: %u,\n", pkt.header.authoritative_entries);
+  printf("    resource_entries: %u\n", pkt.header.resource_entries);
+  printf("}\n");
+
+  /* print questions */
+  for (uint16_t i = 0; i < pkt.header.questions; i++) {
+    printf("DnsQuestion {\n");
+    printf("    name: \"%s\",\n", pkt.questions[i].name);
+    printf("    qtype: %s\n", querytype_to_str(pkt.questions[i].qtype));
+    printf("}\n");
+  }
+
+  /* print answers */
+  for (uint16_t i = 0; i < pkt.header.answers; i++) {
+    DnsRecord *r = &pkt.answers[i];
+    if (r->kind == DNS_RECORD_A) {
+      printf("A {\n");
+      printf("    domain: \"%s\",\n", r->domain);
+      printf("    addr: %u.%u.%u.%u,\n", r->addr[0], r->addr[1], r->addr[2],
+             r->addr[3]);
+      printf("    ttl: %u\n", r->ttl);
+      printf("}\n");
+    } else {
+      printf("UNKNOWN {\n");
+      printf("    domain: \"%s\",\n", r->domain);
+      printf("    qtype: %u,\n", r->qtype);
+      printf("    data_len: %u,\n", r->data_len);
+      printf("    ttl: %u\n", r->ttl);
+      printf("}\n");
+    }
+  }
+
+  /* print authorities */
+  for (uint16_t i = 0; i < pkt.header.authoritative_entries; i++) {
+    DnsRecord *r = &pkt.authorities[i];
+    if (r->kind == DNS_RECORD_A) {
+      printf("A {\n");
+      printf("    domain: \"%s\",\n", r->domain);
+      printf("    addr: %u.%u.%u.%u,\n", r->addr[0], r->addr[1], r->addr[2],
+             r->addr[3]);
+      printf("    ttl: %u\n", r->ttl);
+      printf("}\n");
+    } else {
+      printf("UNKNOWN {\n");
+      printf("    domain: \"%s\",\n", r->domain);
+      printf("    qtype: %u,\n", r->qtype);
+      printf("    data_len: %u,\n", r->data_len);
+      printf("    ttl: %u\n", r->ttl);
+      printf("}\n");
+    }
+  }
+
+  /* print resources */
+  for (uint16_t i = 0; i < pkt.header.resource_entries; i++) {
+    DnsRecord *r = &pkt.resources[i];
+    if (r->kind == DNS_RECORD_A) {
+      printf("A {\n");
+      printf("    domain: \"%s\",\n", r->domain);
+      printf("    addr: %u.%u.%u.%u,\n", r->addr[0], r->addr[1], r->addr[2],
+             r->addr[3]);
+      printf("    ttl: %u\n", r->ttl);
+      printf("}\n");
+    } else {
+      printf("UNKNOWN {\n");
+      printf("    domain: \"%s\",\n", r->domain);
+      printf("    qtype: %u,\n", r->qtype);
+      printf("    data_len: %u,\n", r->data_len);
+      printf("    ttl: %u\n", r->ttl);
+      printf("}\n");
+    }
+  }
+
+  dns_packet_free(&pkt);
   return 0;
 }
