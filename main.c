@@ -1,13 +1,18 @@
+#include <arpa/inet.h>
 #include <complex.h>
 #include <ctype.h>
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #define BUFFER_SIZE 512
+#define QNAME_MAX 256
 
 typedef struct {
   uint8_t buf[BUFFER_SIZE];
@@ -131,6 +136,64 @@ int buffer_read_qname(BytePacketBuffer *bfp, char *out, size_t out_size) {
   return 0;
 }
 
+int buffer_write(BytePacketBuffer *bfp, uint8_t val) {
+  if (bfp->pos >= BUFFER_SIZE)
+    return -1;
+  bfp->buf[bfp->pos++] = val;
+  return 0;
+}
+
+int buffer_write_u8(BytePacketBuffer *bfp, uint8_t val) {
+  return buffer_write(bfp, val);
+}
+
+// mask with 1111111111111(0xFF) to keep only the lowest 8 bits
+// and discard the remaining.
+int buffer_write_u16(BytePacketBuffer *bfp, uint16_t val) {
+  if (buffer_write(bfp, (val >> 8) & 0xFF))
+    return -1;
+  if (buffer_write(bfp, (val >> 0) & 0xFF))
+    return -1;
+  return 0;
+}
+
+int buffer_write_u32(BytePacketBuffer *bfp, uint32_t val) {
+  if (buffer_write(bfp, (val >> 24) & 0xFF))
+    return -1;
+  if (buffer_write(bfp, (val >> 16) & 0xFF))
+    return -1;
+  if (buffer_write(bfp, (val >> 8) & 0xFF))
+    return -1;
+  if (buffer_write(bfp, (val >> 0) & 0xFF))
+    return -1;
+  return 0;
+}
+
+int buffer_write_qname(BytePacketBuffer *bfp, const char *qname) {
+  char tmp[QNAME_MAX];
+  strncpy(tmp, qname, QNAME_MAX - 1);
+  tmp[QNAME_MAX - 1] = '\0';
+
+  char *label = strtok(tmp, ".");
+  while (label != NULL) {
+    size_t len = strlen(label);
+    // each label can be atmost 63 characters long
+    // RFC 1035
+    if (len > 0x3f)
+      return -1;
+
+    if (buffer_write_u8(bfp, (uint8_t)len))
+      return -1;
+
+    for (size_t i = 0; i < len; i++) {
+      if (buffer_write_u8(bfp, (uint8_t)label[i]))
+        return -1;
+    }
+    label = strtok(NULL, ".");
+  }
+  return buffer_write_u8(bfp, 0);
+}
+
 /*
  * ResultCode
  */
@@ -241,6 +304,36 @@ int dns_header_read(DnsHeader *h, BytePacketBuffer *bfp) {
   return 0;
 }
 
+int dns_header_write(DnsHeader *h, BytePacketBuffer *bfp) {
+  if (buffer_write_u16(bfp, h->id))
+    return -1;
+
+  uint8_t a = (h->recursion_desired & 0x1) |
+              ((h->truncated_message & 0x1) << 1) |
+              ((h->authoritative_answer & 0x1) << 2) |
+              ((h->opcode & 0xF) << 3) | ((h->response & 0x1) << 7);
+
+  uint8_t b = (h->rescode & 0xF) | ((h->checking_disabled & 0x1) << 4) |
+              ((h->authed_data & 0x1) << 5) | ((h->z & 0x1) << 6) |
+              ((h->recursion_available & 0x1) << 7);
+
+  if (buffer_write_u8(bfp, a))
+    return -1;
+  if (buffer_write_u8(bfp, b))
+    return -1;
+
+  if (buffer_write_u16(bfp, h->questions))
+    return -1;
+  if (buffer_write_u16(bfp, h->answers))
+    return -1;
+  if (buffer_write_u16(bfp, h->authoritative_entries))
+    return -1;
+  if (buffer_write_u16(bfp, h->resource_entries))
+    return -1;
+
+  return 0;
+}
+
 typedef enum {
   QUERY_UNKNOWN = 0,
   QUERY_A = 1,
@@ -282,17 +375,17 @@ uint16_t querytype_to_num(QueryType qt) { return qt.num; }
  */
 
 typedef struct {
-  char name[256];
+  char name[QNAME_MAX];
   QueryType qtype;
 } DnsQuestion;
 
 void dns_question_init(DnsQuestion *q) {
-  memset(q->name, 0, 256);
+  memset(q->name, 0, QNAME_MAX);
   q->qtype = querytype_from_num(0);
 }
 
 int dns_questions_read(DnsQuestion *q, BytePacketBuffer *bfp) {
-  if (buffer_read_qname(bfp, q->name, 256))
+  if (buffer_read_qname(bfp, q->name, QNAME_MAX))
     return -1;
 
   uint16_t qtype_num;
@@ -307,6 +400,16 @@ int dns_questions_read(DnsQuestion *q, BytePacketBuffer *bfp) {
   return 0;
 }
 
+int dns_question_write(DnsQuestion *q, BytePacketBuffer *bfp) {
+  if (buffer_write_qname(bfp, q->name))
+    return -1;
+  if (buffer_write_u16(bfp, querytype_to_num(q->qtype)))
+    return -1;
+  if (buffer_write_u16(bfp, 1))
+    return -1;
+  return 0;
+}
+
 /*
  * DNS RECORD
  */
@@ -315,7 +418,7 @@ typedef enum { DNS_RECORD_UNKNOWN = 0, DNS_RECORD_A = 1 } DnsRecordKind;
 
 typedef struct {
   DnsRecordKind kind;
-  char domain[256];
+  char domain[QNAME_MAX];
   uint32_t ttl;
   uint8_t addr[4];
   uint16_t qtype;
@@ -323,7 +426,7 @@ typedef struct {
 } DnsRecord;
 
 int dns_record_read(BytePacketBuffer *bfp, DnsRecord *out) {
-  if (buffer_read_qname(bfp, out->domain, 256))
+  if (buffer_read_qname(bfp, out->domain, QNAME_MAX))
     return -1;
 
   uint16_t qname_type;
@@ -368,6 +471,36 @@ int dns_record_read(BytePacketBuffer *bfp, DnsRecord *out) {
   return 0;
 }
 
+int dns_record_write(DnsRecord *r, BytePacketBuffer *bfp) {
+  switch (r->kind) {
+  case DNS_RECORD_A:
+    if (buffer_write_qname(bfp, r->domain))
+      return -1;
+    if (buffer_write_u16(bfp, 1))
+      return -1;
+    if (buffer_write_u16(bfp, 1))
+      return -1;
+    if (buffer_write_u32(bfp, r->ttl))
+      return -1;
+    if (buffer_write_u32(bfp, 4))
+      return -1;
+    if (buffer_write_u8(bfp, r->addr[0]))
+      return -1;
+    if (buffer_write_u8(bfp, r->addr[1]))
+      return -1;
+    if (buffer_write_u8(bfp, r->addr[2]))
+      return -1;
+    if (buffer_write_u8(bfp, r->addr[3]))
+      return -1;
+    break;
+  default:
+    printf("Skipping UNKNOWN record for domain: %s\n", r->domain);
+    break;
+  }
+
+  return 0;
+}
+
 /*
  * DNS PACKET
  */
@@ -378,6 +511,12 @@ typedef struct {
   DnsRecord *answers;
   DnsRecord *authorities;
   DnsRecord *resources;
+
+  // counts for dynamically allocated arrays
+  size_t questions_count;
+  size_t answers_count;
+  size_t authorities_count;
+  size_t resources_count;
 } DnsPacket;
 
 void dns_packet_init(DnsPacket *pkt) {
@@ -386,6 +525,10 @@ void dns_packet_init(DnsPacket *pkt) {
   pkt->answers = NULL;
   pkt->authorities = NULL;
   pkt->resources = NULL;
+  pkt->questions_count = 0;
+  pkt->answers_count = 0;
+  pkt->authorities_count = 0;
+  pkt->resources_count = 0;
 }
 
 void dns_packet_free(DnsPacket *pkt) {
@@ -406,12 +549,14 @@ int dns_packet_from_buffer(BytePacketBuffer *bfp, DnsPacket *pkt) {
     dns_question_init(&pkt->questions[i]);
     if (dns_questions_read(&pkt->questions[i], bfp))
       return -1;
+    pkt->questions_count++;
   }
 
   pkt->answers = calloc(pkt->header.answers, sizeof(DnsRecord));
   for (uint16_t i = 0; i < pkt->header.answers; i++) {
     if (dns_record_read(bfp, &pkt->answers[i]))
       return -1;
+    pkt->answers_count++;
   }
 
   pkt->authorities =
@@ -419,70 +564,83 @@ int dns_packet_from_buffer(BytePacketBuffer *bfp, DnsPacket *pkt) {
   for (uint16_t i = 0; i < pkt->header.authoritative_entries; i++) {
     if (dns_record_read(bfp, &pkt->authorities[i]))
       return -1;
+    pkt->authorities_count++;
   }
 
   pkt->resources = calloc(pkt->header.resource_entries, sizeof(DnsRecord));
   for (uint16_t i = 0; i < pkt->header.resource_entries; i++) {
     if (dns_record_read(bfp, &pkt->resources[i]))
       return -1;
+    pkt->resources_count++;
   }
 
   return 0;
 }
+int dns_packet_write(DnsPacket *pkt, BytePacketBuffer *bfp) {
+  pkt->header.questions = (uint16_t)pkt->questions_count;
+  pkt->header.answers = (uint16_t)pkt->answers_count;
+  pkt->header.authoritative_entries = (uint16_t)pkt->authorities_count;
+  pkt->header.resource_entries = (uint16_t)pkt->resources_count;
 
-int main(void) {
-  FILE *f = fopen("response_packet.txt", "rb");
-  if (!f) {
-    perror("fopen");
-    return 1;
-  }
+  if (dns_header_write(&pkt->header, bfp))
+    return -1;
 
-  BytePacketBuffer buff;
-  buffer_init(&buff);
-  fread(buff.buf, 1, BUFFER_SIZE, f);
-  fclose(f);
+  for (size_t i = 0; i < pkt->questions_count; i++)
+    if (dns_question_write(&pkt->questions[i], bfp))
+      return -1;
 
-  DnsPacket pkt;
-  if (dns_packet_from_buffer(&buff, &pkt)) {
-    fprintf(stderr, "failed to parse packet\n");
-    return 1;
-  }
+  for (size_t i = 0; i < pkt->answers_count; i++)
+    if (dns_record_write(&pkt->answers[i], bfp))
+      return -1;
 
-  /* print header */
+  for (size_t i = 0; i < pkt->authorities_count; i++)
+    if (dns_record_write(&pkt->authorities[i], bfp))
+      return -1;
+
+  for (size_t i = 0; i < pkt->resources_count; i++)
+    if (dns_record_write(&pkt->resources[i], bfp))
+      return -1;
+
+  return 0;
+}
+
+/*
+ * print helpers
+ */
+
+static void print_packet(DnsPacket *pkt) {
   printf("DnsHeader {\n");
-  printf("    id: %u,\n", pkt.header.id);
+  printf("    id: %u,\n", pkt->header.id);
   printf("    recursion_desired: %s,\n",
-         pkt.header.recursion_desired ? "true" : "false");
+         pkt->header.recursion_desired ? "true" : "false");
   printf("    truncated_message: %s,\n",
-         pkt.header.truncated_message ? "true" : "false");
+         pkt->header.truncated_message ? "true" : "false");
   printf("    authoritative_answer: %s,\n",
-         pkt.header.authoritative_answer ? "true" : "false");
-  printf("    opcode: %u,\n", pkt.header.opcode);
-  printf("    response: %s,\n", pkt.header.response ? "true" : "false");
-  printf("    rescode: %s,\n", resultcode_to_str(pkt.header.rescode));
+         pkt->header.authoritative_answer ? "true" : "false");
+  printf("    opcode: %u,\n", pkt->header.opcode);
+  printf("    response: %s,\n", pkt->header.response ? "true" : "false");
+  printf("    rescode: %s,\n", resultcode_to_str(pkt->header.rescode));
   printf("    checking_disabled: %s,\n",
-         pkt.header.checking_disabled ? "true" : "false");
-  printf("    authed_data: %s,\n", pkt.header.authed_data ? "true" : "false");
-  printf("    z: %s,\n", pkt.header.z ? "true" : "false");
+         pkt->header.checking_disabled ? "true" : "false");
+  printf("    authed_data: %s,\n", pkt->header.authed_data ? "true" : "false");
+  printf("    z: %s,\n", pkt->header.z ? "true" : "false");
   printf("    recursion_available: %s,\n",
-         pkt.header.recursion_available ? "true" : "false");
-  printf("    questions: %u,\n", pkt.header.questions);
-  printf("    answers: %u,\n", pkt.header.answers);
-  printf("    authoritative_entries: %u,\n", pkt.header.authoritative_entries);
-  printf("    resource_entries: %u\n", pkt.header.resource_entries);
+         pkt->header.recursion_available ? "true" : "false");
+  printf("    questions: %u,\n", pkt->header.questions);
+  printf("    answers: %u,\n", pkt->header.answers);
+  printf("    authoritative_entries: %u,\n", pkt->header.authoritative_entries);
+  printf("    resource_entries: %u\n", pkt->header.resource_entries);
   printf("}\n");
 
-  /* print questions */
-  for (uint16_t i = 0; i < pkt.header.questions; i++) {
+  for (size_t i = 0; i < pkt->questions_count; i++) {
     printf("DnsQuestion {\n");
-    printf("    name: \"%s\",\n", pkt.questions[i].name);
-    printf("    qtype: %s\n", querytype_to_str(pkt.questions[i].qtype));
+    printf("    name: \"%s\",\n", pkt->questions[i].name);
+    printf("    qtype: %s\n", querytype_to_str(pkt->questions[i].qtype));
     printf("}\n");
   }
 
-  /* print answers */
-  for (uint16_t i = 0; i < pkt.header.answers; i++) {
-    DnsRecord *r = &pkt.answers[i];
+  for (size_t i = 0; i < pkt->answers_count; i++) {
+    DnsRecord *r = &pkt->answers[i];
     if (r->kind == DNS_RECORD_A) {
       printf("A {\n");
       printf("    domain: \"%s\",\n", r->domain);
@@ -500,9 +658,8 @@ int main(void) {
     }
   }
 
-  /* print authorities */
-  for (uint16_t i = 0; i < pkt.header.authoritative_entries; i++) {
-    DnsRecord *r = &pkt.authorities[i];
+  for (size_t i = 0; i < pkt->authorities_count; i++) {
+    DnsRecord *r = &pkt->authorities[i];
     if (r->kind == DNS_RECORD_A) {
       printf("A {\n");
       printf("    domain: \"%s\",\n", r->domain);
@@ -520,9 +677,8 @@ int main(void) {
     }
   }
 
-  /* print resources */
-  for (uint16_t i = 0; i < pkt.header.resource_entries; i++) {
-    DnsRecord *r = &pkt.resources[i];
+  for (size_t i = 0; i < pkt->resources_count; i++) {
+    DnsRecord *r = &pkt->resources[i];
     if (r->kind == DNS_RECORD_A) {
       printf("A {\n");
       printf("    domain: \"%s\",\n", r->domain);
@@ -539,7 +695,92 @@ int main(void) {
       printf("}\n");
     }
   }
+}
+
+int main(void) {
+  const char *qname = "google.com";
+  QueryType qtype = querytype_from_num(1);
+
+  // google's public dns
+  const char *server = "8.8.8.8";
+  uint16_t port = 53;
+
+  // DGRAM -> UDP socket
+  int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sockfd < 0) {
+    perror("socket");
+    return 1;
+  }
+
+  struct sockaddr_in local = {0};
+  local.sin_family = AF_INET;
+  local.sin_addr.s_addr = INADDR_ANY;
+  local.sin_port = htons(10053);
+
+  if (bind(sockfd, (struct sockaddr *)&local, sizeof(local)) < 0) {
+    perror("bind");
+    close(sockfd);
+    return 1;
+  }
+
+  DnsPacket pkt;
+  dns_packet_init(&pkt);
+
+  pkt.header.id = 6666;
+  pkt.header.recursion_desired = 1;
+  pkt.header.questions = 1;
+
+  pkt.questions = calloc(1, sizeof(DnsQuestion));
+  pkt.questions_count = 1;
+  dns_question_init(&pkt.questions[0]);
+  strncpy(pkt.questions[0].name, qname, QNAME_MAX - 1);
+  pkt.questions[0].qtype = qtype;
+
+  BytePacketBuffer req;
+  buffer_init(&req);
+
+  if (dns_packet_write(&pkt, &req)) {
+    fprintf(stderr, "failed to write packet\n");
+    close(sockfd);
+    return 1;
+  }
+
+  struct sockaddr_in dest = {0};
+  dest.sin_family = AF_INET;
+  dest.sin_port = htons(port);
+  inet_pton(AF_INET, server, &dest.sin_addr);
+
+  if (sendto(sockfd, req.buf, req.pos, 0, (struct sockaddr *)&dest,
+             sizeof(dest)) < 0) {
+    perror("sendto");
+    close(sockfd);
+    return 1;
+  }
+
+  BytePacketBuffer res;
+  buffer_init(&res);
+
+  struct sockaddr_in src;
+  socklen_t src_len = sizeof(src);
+  if (recvfrom(sockfd, res.buf, BUFFER_SIZE, 0, (struct sockaddr *)&src,
+               &src_len) < 0) {
+    perror("recvfrom");
+    close(sockfd);
+    return 1;
+  }
+
+  close(sockfd);
+
+  DnsPacket res_pkt;
+  if (dns_packet_from_buffer(&res, &res_pkt)) {
+    fprintf(stderr, "failed to parse response\n");
+    return 1;
+  }
+
+  print_packet(&res_pkt);
 
   dns_packet_free(&pkt);
+  dns_packet_free(&res_pkt);
+
   return 0;
 }

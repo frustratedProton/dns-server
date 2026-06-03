@@ -14,8 +14,11 @@ build/main
 ```
 
 ### Packet Examples
+To view the included packet dumps, use `hexdump`:
 
-View the included packet dumps:
-
+```bash
 hexdump -C query_packet.txt
+```
+```bash
 hexdump -C response_packet.txt
+```
