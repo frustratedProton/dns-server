@@ -576,7 +576,7 @@ int dns_record_write(DnsRecord *r, BytePacketBuffer *bfp) {
       return -1;
     if (buffer_write_u32(bfp, r->ttl))
       return -1;
-    if (buffer_write_u32(bfp, 4))
+    if (buffer_write_u16(bfp, 4))
       return -1;
     if (buffer_write_u8(bfp, r->addr[0]))
       return -1;
