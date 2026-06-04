@@ -69,6 +69,19 @@ int buffer_read_u32(BytePacketBuffer *bfp, uint32_t *out) {
   return 0;
 }
 
+int buffer_set(BytePacketBuffer *bfp, size_t pos, uint8_t val) {
+  bfp->buf[pos] = val;
+  return 0;
+}
+
+int buffer_set_u16(BytePacketBuffer *bfp, size_t pos, uint16_t val) {
+  if (buffer_set(bfp, pos, (val >> 8) & 0xFF))
+    return -1;
+  if (buffer_set(bfp, pos + 1, (val >> 0) & 0xFF))
+    return -1;
+  return 0;
+}
+
 /*
  * read a qname
  */
@@ -337,6 +350,10 @@ int dns_header_write(DnsHeader *h, BytePacketBuffer *bfp) {
 typedef enum {
   QUERY_UNKNOWN = 0,
   QUERY_A = 1,
+  QUERY_NS = 2,
+  QUERY_CNAME = 3,
+  QUERY_MX = 4,
+  QUERY_AAAA = 5
 } QueryTypeKind;
 
 typedef struct {
@@ -348,6 +365,14 @@ static const char *querytype_to_str(QueryType qt) {
   switch (qt.kind) {
   case QUERY_A:
     return "A";
+  case QUERY_NS:
+    return "NS";
+  case QUERY_CNAME:
+    return "CNAME";
+  case QUERY_MX:
+    return "MX";
+  case QUERY_AAAA:
+    return "AAAA";
   default:
     return "UNKNOWN";
   }
@@ -358,11 +383,27 @@ QueryType querytype_from_num(uint16_t num) {
   switch (num) {
   case 1:
     qt.kind = QUERY_A;
-    qt.num = 1;
+    qt.num = num;
+    break;
+  case 2:
+    qt.kind = QUERY_NS;
+    qt.num = num;
+    break;
+  case 5:
+    qt.kind = QUERY_CNAME;
+    qt.num = num;
+    break;
+  case 15:
+    qt.kind = QUERY_MX;
+    qt.num = num;
+    break;
+  case 28:
+    qt.kind = QUERY_AAAA;
+    qt.num = num;
     break;
   default:
     qt.kind = QUERY_UNKNOWN;
-    qt.num = 0;
+    qt.num = num;
     break;
   }
   return qt;
@@ -414,15 +455,27 @@ int dns_question_write(DnsQuestion *q, BytePacketBuffer *bfp) {
  * DNS RECORD
  */
 
-typedef enum { DNS_RECORD_UNKNOWN = 0, DNS_RECORD_A = 1 } DnsRecordKind;
+typedef enum {
+  DNS_RECORD_UNKNOWN = 0,
+  DNS_RECORD_A = 1,
+  DNS_RECORD_NS = 2,
+  DNS_RECORD_CNAME = 5,
+  DNS_RECORD_MX = 15,
+  DNS_RECORD_AAAA = 28,
+} DnsRecordKind;
 
 typedef struct {
   DnsRecordKind kind;
   char domain[QNAME_MAX];
   uint32_t ttl;
-  uint8_t addr[4];
-  uint16_t qtype;
-  uint16_t data_len;
+
+  uint8_t addr[4];      /* A record */
+  uint16_t addr6[8];    /* AAAA record */
+  char host[QNAME_MAX]; /* NS, CNAME, MX */
+  uint16_t priority;    /* MX */
+
+  uint16_t qtype;    /* UNKNOWN */
+  uint16_t data_len; /* UNKNOWN */
 } DnsRecord;
 
 int dns_record_read(BytePacketBuffer *bfp, DnsRecord *out) {
@@ -458,6 +511,47 @@ int dns_record_read(BytePacketBuffer *bfp, DnsRecord *out) {
     out->addr[3] = (raw_addr >> 0) & 0xFF;
     break;
   }
+  case QUERY_AAAA: {
+    uint32_t r1, r2, r3, r4;
+    if (buffer_read_u32(bfp, &r1))
+      return -1;
+    if (buffer_read_u32(bfp, &r2))
+      return -1;
+    if (buffer_read_u32(bfp, &r3))
+      return -1;
+    if (buffer_read_u32(bfp, &r4))
+      return -1;
+
+    out->kind = DNS_RECORD_AAAA;
+    out->addr6[0] = (r1 >> 16) & 0xFFFF;
+    out->addr6[1] = (r1 >> 0) & 0xFFFF;
+    out->addr6[2] = (r2 >> 16) & 0xFFFF;
+    out->addr6[3] = (r2 >> 0) & 0xFFFF;
+    out->addr6[4] = (r3 >> 16) & 0xFFFF;
+    out->addr6[5] = (r3 >> 0) & 0xFFFF;
+    out->addr6[6] = (r4 >> 16) & 0xFFFF;
+    out->addr6[7] = (r4 >> 0) & 0xFFFF;
+    break;
+  }
+  case QUERY_NS:
+    out->kind = DNS_RECORD_NS;
+    if (buffer_read_qname(bfp, out->host, QNAME_MAX))
+      return -1;
+    break;
+
+  case QUERY_CNAME:
+    out->kind = DNS_RECORD_CNAME;
+    if (buffer_read_qname(bfp, out->host, QNAME_MAX))
+      return -1;
+    break;
+
+  case QUERY_MX:
+    out->kind = DNS_RECORD_MX;
+    if (buffer_read_u16(bfp, &out->priority))
+      return -1;
+    if (buffer_read_qname(bfp, out->host, QNAME_MAX))
+      return -1;
+    break;
   default:
     if (buffer_step(bfp, data_len))
       return -1;
@@ -493,6 +587,73 @@ int dns_record_write(DnsRecord *r, BytePacketBuffer *bfp) {
     if (buffer_write_u8(bfp, r->addr[3]))
       return -1;
     break;
+
+  case DNS_RECORD_NS:
+  case DNS_RECORD_CNAME: {
+    uint16_t type_num = (r->kind == DNS_RECORD_NS) ? 2 : 5;
+    if (buffer_write_qname(bfp, r->domain))
+      return -1;
+    if (buffer_write_u16(bfp, type_num))
+      return -1;
+    if (buffer_write_u16(bfp, 1))
+      return -1;
+    if (buffer_write_u32(bfp, r->ttl))
+      return -1;
+
+    size_t pos = bfp->pos;
+    if (buffer_write_u16(bfp, 0))
+      return -1;
+    if (buffer_write_qname(bfp, r->host))
+      return -1;
+
+    uint16_t size = (uint16_t)(bfp->pos - (pos + 2));
+    if (buffer_set_u16(bfp, pos, size))
+      return -1;
+    break;
+  }
+
+  case DNS_RECORD_MX: {
+    if (buffer_write_qname(bfp, r->domain))
+      return -1;
+    if (buffer_write_u16(bfp, 15))
+      return -1;
+    if (buffer_write_u16(bfp, 1))
+      return -1;
+    if (buffer_write_u32(bfp, r->ttl))
+      return -1;
+
+    size_t pos = bfp->pos;
+    if (buffer_write_u16(bfp, 0))
+      return -1;
+    if (buffer_write_u16(bfp, r->priority))
+      return -1;
+    if (buffer_write_qname(bfp, r->host))
+      return -1;
+
+    uint16_t size = (uint16_t)(bfp->pos - (pos + 2));
+    if (buffer_set_u16(bfp, pos, size))
+      return -1;
+    break;
+  }
+
+  case DNS_RECORD_AAAA: {
+    if (buffer_write_qname(bfp, r->domain))
+      return -1;
+    if (buffer_write_u16(bfp, 28))
+      return -1;
+    if (buffer_write_u16(bfp, 1))
+      return -1;
+    if (buffer_write_u32(bfp, r->ttl))
+      return -1;
+    if (buffer_write_u16(bfp, 16))
+      return -1;
+    for (int i = 0; i < 8; i++) {
+      if (buffer_write_u16(bfp, r->addr6[i]))
+        return -1;
+    }
+    break;
+  }
+
   default:
     printf("Skipping UNKNOWN record for domain: %s\n", r->domain);
     break;
@@ -608,6 +769,63 @@ int dns_packet_write(DnsPacket *pkt, BytePacketBuffer *bfp) {
  * print helpers
  */
 
+static void print_record(DnsRecord *r) {
+  switch (r->kind) {
+  case DNS_RECORD_A:
+    printf("A {\n");
+    printf("    domain: \"%s\",\n", r->domain);
+    printf("    addr: %u.%u.%u.%u,\n", r->addr[0], r->addr[1], r->addr[2],
+           r->addr[3]);
+    printf("    ttl: %u\n", r->ttl);
+    printf("}\n");
+    break;
+
+  case DNS_RECORD_AAAA:
+    printf("AAAA {\n");
+    printf("    domain: \"%s\",\n", r->domain);
+    printf("    addr: %x:%x:%x:%x:%x:%x:%x:%x,\n", r->addr6[0], r->addr6[1],
+           r->addr6[2], r->addr6[3], r->addr6[4], r->addr6[5], r->addr6[6],
+           r->addr6[7]);
+    printf("    ttl: %u\n", r->ttl);
+    printf("}\n");
+    break;
+
+  case DNS_RECORD_NS:
+    printf("NS {\n");
+    printf("    domain: \"%s\",\n", r->domain);
+    printf("    host: \"%s\",\n", r->host);
+    printf("    ttl: %u\n", r->ttl);
+    printf("}\n");
+    break;
+
+  case DNS_RECORD_CNAME:
+    printf("CNAME {\n");
+    printf("    domain: \"%s\",\n", r->domain);
+    printf("    host: \"%s\",\n", r->host);
+    printf("    ttl: %u\n", r->ttl);
+    printf("}\n");
+    break;
+
+  case DNS_RECORD_MX:
+    printf("MX {\n");
+    printf("    domain: \"%s\",\n", r->domain);
+    printf("    priority: %u,\n", r->priority);
+    printf("    host: \"%s\",\n", r->host);
+    printf("    ttl: %u\n", r->ttl);
+    printf("}\n");
+    break;
+
+  default:
+    printf("UNKNOWN {\n");
+    printf("    domain: \"%s\",\n", r->domain);
+    printf("    qtype: %u,\n", r->qtype);
+    printf("    data_len: %u,\n", r->data_len);
+    printf("    ttl: %u\n", r->ttl);
+    printf("}\n");
+    break;
+  }
+}
+
 static void print_packet(DnsPacket *pkt) {
   printf("DnsHeader {\n");
   printf("    id: %u,\n", pkt->header.id);
@@ -639,67 +857,19 @@ static void print_packet(DnsPacket *pkt) {
     printf("}\n");
   }
 
-  for (size_t i = 0; i < pkt->answers_count; i++) {
-    DnsRecord *r = &pkt->answers[i];
-    if (r->kind == DNS_RECORD_A) {
-      printf("A {\n");
-      printf("    domain: \"%s\",\n", r->domain);
-      printf("    addr: %u.%u.%u.%u,\n", r->addr[0], r->addr[1], r->addr[2],
-             r->addr[3]);
-      printf("    ttl: %u\n", r->ttl);
-      printf("}\n");
-    } else {
-      printf("UNKNOWN {\n");
-      printf("    domain: \"%s\",\n", r->domain);
-      printf("    qtype: %u,\n", r->qtype);
-      printf("    data_len: %u,\n", r->data_len);
-      printf("    ttl: %u\n", r->ttl);
-      printf("}\n");
-    }
-  }
+  for (size_t i = 0; i < pkt->answers_count; i++)
+    print_record(&pkt->answers[i]);
 
-  for (size_t i = 0; i < pkt->authorities_count; i++) {
-    DnsRecord *r = &pkt->authorities[i];
-    if (r->kind == DNS_RECORD_A) {
-      printf("A {\n");
-      printf("    domain: \"%s\",\n", r->domain);
-      printf("    addr: %u.%u.%u.%u,\n", r->addr[0], r->addr[1], r->addr[2],
-             r->addr[3]);
-      printf("    ttl: %u\n", r->ttl);
-      printf("}\n");
-    } else {
-      printf("UNKNOWN {\n");
-      printf("    domain: \"%s\",\n", r->domain);
-      printf("    qtype: %u,\n", r->qtype);
-      printf("    data_len: %u,\n", r->data_len);
-      printf("    ttl: %u\n", r->ttl);
-      printf("}\n");
-    }
-  }
+  for (size_t i = 0; i < pkt->authorities_count; i++)
+    print_record(&pkt->authorities[i]);
 
-  for (size_t i = 0; i < pkt->resources_count; i++) {
-    DnsRecord *r = &pkt->resources[i];
-    if (r->kind == DNS_RECORD_A) {
-      printf("A {\n");
-      printf("    domain: \"%s\",\n", r->domain);
-      printf("    addr: %u.%u.%u.%u,\n", r->addr[0], r->addr[1], r->addr[2],
-             r->addr[3]);
-      printf("    ttl: %u\n", r->ttl);
-      printf("}\n");
-    } else {
-      printf("UNKNOWN {\n");
-      printf("    domain: \"%s\",\n", r->domain);
-      printf("    qtype: %u,\n", r->qtype);
-      printf("    data_len: %u,\n", r->data_len);
-      printf("    ttl: %u\n", r->ttl);
-      printf("}\n");
-    }
-  }
+  for (size_t i = 0; i < pkt->resources_count; i++)
+    print_record(&pkt->resources[i]);
 }
 
 int main(void) {
-  const char *qname = "google.com";
-  QueryType qtype = querytype_from_num(1);
+  const char *qname = "yahoo.com";
+  QueryType qtype = querytype_from_num(15);
 
   // google's public dns
   const char *server = "8.8.8.8";
