@@ -1210,49 +1210,91 @@ int handle_query(int sockfd) {
            question->name, querytype_to_str(question->qtype));
 
     DnsPacket result;
-    if (recursive_lookup(question->name, question->qtype, &result) == 0) {
-      packet.questions = calloc(1, sizeof(DnsQuestion));
-      packet.questions_count = 1;
-      packet.questions[0] = *question;
+    // if (recursive_lookup(question->name, question->qtype, &result) == 0) {
+    //   packet.questions = calloc(1, sizeof(DnsQuestion));
+    //   packet.questions_count = 1;
+    //   packet.questions[0] = *question;
 
-      packet.header.rescode = result.header.rescode;
+    //   packet.header.rescode = result.header.rescode;
 
-      if (result.answers_count > 0) {
-        packet.answers = calloc(result.answers_count, sizeof(DnsRecord));
-        packet.answers_count = result.answers_count;
-        memcpy(packet.answers, result.answers,
-               result.answers_count * sizeof(DnsRecord));
+    //   if (result.answers_count > 0) {
+    //     packet.answers = calloc(result.answers_count, sizeof(DnsRecord));
+    //     packet.answers_count = result.answers_count;
+    //     memcpy(packet.answers, result.answers,
+    //            result.answers_count * sizeof(DnsRecord));
 
-        for (size_t i = 0; i < result.answers_count; i++) {
-          printf("Answer: ");
-          print_record(&result.answers[i]);
-        }
-      }
+    //     for (size_t i = 0; i < result.answers_count; i++) {
+    //       printf("Answer: ");
+    //       print_record(&result.answers[i]);
+    //     }
+    //   }
 
-      if (result.authorities_count > 0) {
-        packet.authorities =
-            calloc(result.authorities_count, sizeof(DnsRecord));
-        packet.authorities_count = result.authorities_count;
-        memcpy(packet.authorities, result.authorities,
-               result.authorities_count * sizeof(DnsRecord));
-      }
+    //   if (result.authorities_count > 0) {
+    //     packet.authorities =
+    //         calloc(result.authorities_count, sizeof(DnsRecord));
+    //     packet.authorities_count = result.authorities_count;
+    //     memcpy(packet.authorities, result.authorities,
+    //            result.authorities_count * sizeof(DnsRecord));
+    //   }
 
-      if (result.resources_count > 0) {
-        packet.resources = calloc(result.resources_count, sizeof(DnsRecord));
-        packet.resources_count = result.resources_count;
-        memcpy(packet.resources, result.resources,
-               result.resources_count * sizeof(DnsRecord));
-      }
+    //   if (result.resources_count > 0) {
+    //     packet.resources = calloc(result.resources_count, sizeof(DnsRecord));
+    //     packet.resources_count = result.resources_count;
+    //     memcpy(packet.resources, result.resources,
+    //            result.resources_count * sizeof(DnsRecord));
+    //   }
 
-      dns_packet_free(&result);
+    //   dns_packet_free(&result);
+    // } else {
+    //   packet.header.rescode = SERVFAIL;
+    // }
+    int from_cache = cache_lookup(question->name, question->qtype, &result);
+
+    if (from_cache) {
+      printf("Cache hit: %s\n", question->name);
     } else {
-      packet.header.rescode = SERVFAIL;
+      if (recursive_lookup(question->name, question->qtype, &result) != 0) {
+        packet.header.rescode = SERVFAIL;
+        goto send;
+      }
+      cache_store(question->name, question->qtype, &result);
     }
+
+    packet.questions = calloc(1, sizeof(DnsQuestion));
+    packet.questions_count = 1;
+    packet.questions[0] = *question;
+    packet.header.rescode = result.header.rescode;
+
+    packet.answers = calloc(result.answers_count, sizeof(DnsRecord));
+    packet.answers_count = 0;
+
+    for (size_t i = 0; i < result.answers_count; i++) {
+      packet.answers[packet.answers_count++] = result.answers[i];
+      if (!from_cache) {
+        printf("Answer: ");
+        print_record(&result.answers[i]);
+      }
+    }
+
+    packet.authorities = calloc(result.authorities_count, sizeof(DnsRecord));
+    packet.authorities_count = 0;
+    for (size_t i = 0; i < result.authorities_count; i++)
+      packet.authorities[packet.authorities_count++] = result.authorities[i];
+
+    packet.resources = calloc(result.resources_count, sizeof(DnsRecord));
+    packet.resources_count = 0;
+    for (size_t i = 0; i < result.resources_count; i++)
+      packet.resources[packet.resources_count++] = result.resources[i];
+
+    dns_packet_free(&result);
+
   } else {
     packet.header.rescode = FORMERR;
   }
 
-  /* encode and send response */
+/* encode and send response */
+send:
+  ;
   BytePacketBuffer res_buf;
   buffer_init(&res_buf);
 
@@ -1277,6 +1319,7 @@ int handle_query(int sockfd) {
 }
 
 int main(void) {
+  cache_init();
   int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
   if (sockfd < 0) {
