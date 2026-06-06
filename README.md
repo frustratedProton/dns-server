@@ -1,10 +1,10 @@
-#[WIP] DNS Server
+# [WIP] DNS Server
 
 A very simple DNS server written in C for learning how the DNS protocol works.
 
 Based on Emil Hernvall's guide [dnsguide](https://github.com/EmilHernvall/dnsguide).
 
-### Build
+## Build
 
 ```bash
 gcc main.c -o build/main -Wall -Wextra -Wpedantic

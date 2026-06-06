@@ -10,10 +10,13 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #define BUFFER_SIZE 512
 #define QNAME_MAX 256
+#define CACHE_SIZE 128
+#define MAX_CACHE_RECORDS 12
 
 typedef struct {
   uint8_t buf[BUFFER_SIZE];
@@ -1061,6 +1064,118 @@ int recursive_lookup(const char *qname, QueryType qtype, DnsPacket *out) {
       return 0;
     }
   }
+}
+
+/*
+ * Cache Entry
+ * Store cache with key-value pair for lookup
+ * key = {qname, qtype} -> "google.com" + A
+ * value = {answer record} -> [142.250.x.x, ...]
+ * expiry = {current_time + ttl}
+ */
+typedef struct {
+  char qname[QNAME_MAX];
+  QueryType qtype;
+  DnsRecord records[MAX_CACHE_RECORDS];
+  size_t records_count;
+  time_t expires_at;
+  int valid;
+} CacheEntry;
+
+static CacheEntry cache[CACHE_SIZE];
+
+void cache_init() {
+  for (int i = 0; i < CACHE_SIZE; i++)
+    cache[i].valid = 0;
+}
+
+static size_t cache_find_slot() {
+  // look for an invalid spot by looking thru the arr
+  // (feels kinds slow if cache becomes large - should be fine for 12)
+  for (int i = 0; i < CACHE_SIZE; i++)
+    if (!cache[i].valid)
+      return i;
+
+  // if no invalid spot found
+  // look for an expired slot
+  time_t now = time(NULL);
+  for (int i = 0; i < CACHE_SIZE; i++)
+    if (cache[i].expires_at <= now)
+      return i;
+
+  // if no expired slot found
+  // evict entry closest to expiring
+  // and return it
+  size_t oldest = 0;
+  for (int i = 1; i < CACHE_SIZE; i++)
+    if (cache[i].expires_at < cache[oldest].expires_at)
+      oldest = i;
+  return oldest;
+}
+
+void cache_store(const char *qname, QueryType qtype, DnsPacket *pkt) {
+  if (pkt->answers_count == 0)
+    return;
+
+  size_t slot = cache_find_slot();
+  CacheEntry *entry = &cache[slot];
+
+  strncpy(entry->qname, qname, QNAME_MAX - 1);
+  entry->qname[QNAME_MAX - 1] = '\0';
+  entry->qtype = qtype;
+  entry->records_count = 0;
+  entry->valid = 1;
+
+  // store ttl of first record for expiry
+  entry->expires_at = time(NULL) + pkt->answers[0].ttl;
+
+  for (size_t i = 0; i < pkt->answers_count && i < MAX_CACHE_RECORDS; i++)
+    entry->records[entry->records_count++] = pkt->answers[i];
+}
+
+int cache_lookup(const char *qname, QueryType qtype, DnsPacket *out) {
+  time_t now = time(NULL);
+
+  for (int i = 0; i < CACHE_SIZE; i++) {
+    CacheEntry *entry = &cache[i];
+
+    // skip invalid entries
+    if (!entry->valid)
+      continue;
+    // skip if qtype doenst match
+    if (entry->qtype.num != qtype.num)
+      continue;
+    // skip if qname doesnt match
+    if (strcmp(entry->qname, qname))
+      continue;
+    // if expired, mark entry as invalid
+    if (entry->expires_at <= now) {
+      entry->valid = 0;
+      return 0;
+    }
+
+    // build DnsPacket from cached records
+    dns_packet_init(out);
+    out->answers = calloc(entry->records_count, sizeof(DnsRecord));
+    if (!out->answers)
+      return 0;
+
+    out->answers_count = entry->records_count;
+    uint32_t remaining = (uint32_t)(entry->expires_at - now);
+
+    for (size_t j = 0; j < entry->records_count; j++) {
+      out->answers[j] = entry->records[j];
+      out->answers[j].ttl = remaining; // reset ttl
+    }
+
+    out->header.rescode = NOERROR;
+    out->header.recursion_available = 1;
+    out->header.response = 1;
+
+    return 1;
+  }
+
+  return 0;
 }
 
 int handle_query(int sockfd) {
