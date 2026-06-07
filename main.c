@@ -17,6 +17,7 @@
 #define QNAME_MAX 256
 #define CACHE_SIZE 128
 #define MAX_CACHE_RECORDS 12
+#define COMPRESS_MAX 64
 
 typedef struct {
   uint8_t buf[BUFFER_SIZE];
@@ -86,6 +87,34 @@ int buffer_set_u16(BytePacketBuffer *bfp, size_t pos, uint16_t val) {
   return 0;
 }
 
+typedef struct {
+  char name[QNAME_MAX];
+  size_t offset;
+} CompressEntry;
+
+typedef struct {
+  CompressEntry entries[COMPRESS_MAX];
+  size_t count;
+} CompressTable;
+
+void compress_table_init(CompressTable *ct) { ct->count = 0; }
+
+int compress_table_find(CompressTable *ct, const char *name) {
+  for (size_t i = 0; i < COMPRESS_MAX; i++)
+    if (strcmp(ct->entries[i].name, name) == 0)
+      return (int)ct->entries[i].offset;
+  return -1;
+}
+
+void compress_table_add(CompressTable *ct, const char *name, size_t offset) {
+  if (ct->count >= COMPRESS_MAX)
+    return;
+  strncpy(ct->entries[ct->count].name, name, QNAME_MAX - 1);
+  ct->entries[ct->count].name[QNAME_MAX - 1] = '\0';
+  ct->entries[ct->count].offset = offset;
+  ct->count++;
+}
+
 /*
  * read a qname
  */
@@ -113,7 +142,12 @@ int buffer_read_qname(BytePacketBuffer *bfp, char *out, size_t out_size) {
       if (buffer_get(bfp, pos + 1, &b2))
         return -1;
 
-      uint16_t offset = ((len ^ 0xC0) << 8) | b2;
+      uint16_t offset = (((uint16_t)len ^ 0xC0) << 8) | b2;
+
+      if (offset >= BUFFER_SIZE)
+        return -1;
+      if (offset >= pos)
+        return -1;
 
       if (!jumped)
         buffer_seek(bfp, pos + 2);
@@ -211,6 +245,48 @@ int buffer_write_qname(BytePacketBuffer *bfp, const char *qname) {
   return buffer_write_u8(bfp, 0);
 }
 
+int buffer_write_qname_compressed(BytePacketBuffer *bfp, const char *qname,
+                                  CompressTable *ct) {
+  char tmp[QNAME_MAX];
+  strncpy(tmp, qname, QNAME_MAX - 1);
+  tmp[QNAME_MAX - 1] = '\0';
+
+  char *cursor = tmp;
+
+  while (*cursor != '\0') {
+    // check if suffix exists in CompressTable
+    int found = compress_table_find(ct, cursor);
+    if (found >= 0) {
+      //   write a compression pointer
+      if (buffer_write_u8(bfp, 0xC0 | ((found >> 8) & 0xFF)))
+        return -1;
+      if (buffer_write_u8(bfp, found & 0xFF))
+        return -1;
+      return 0;
+    }
+
+    compress_table_add(ct, cursor, bfp->pos);
+
+    char *dot = strchr(cursor, '.');
+    size_t label_len = dot ? (size_t)(dot - cursor) : strlen(cursor);
+
+    if (label_len > 0x3f)
+      return -1;
+
+    if (buffer_write_u8(bfp, (uint8_t)label_len))
+      return -1;
+    for (size_t i = 0; i < label_len; i++) {
+      if (buffer_write_u8(bfp, (uint8_t)cursor[i]))
+        return -1;
+    }
+
+    cursor += label_len;
+    if (*cursor == '.')
+      cursor++;
+  }
+  return buffer_write_u8(bfp, 0);
+}
+
 /*
  * ResultCode
  */
@@ -262,7 +338,6 @@ static const char *resultcode_to_str(ResultCode rc) {
 /*
  * DNS HEADER
  */
-
 typedef struct {
   uint16_t id;
 
@@ -445,9 +520,13 @@ int dns_questions_read(DnsQuestion *q, BytePacketBuffer *bfp) {
   return 0;
 }
 
-int dns_question_write(DnsQuestion *q, BytePacketBuffer *bfp) {
+int dns_question_write(DnsQuestion *q, BytePacketBuffer *bfp,
+                       CompressTable *ct) {
   if (buffer_write_qname(bfp, q->name))
     return -1;
+
+  compress_table_add(ct, q->name, 12);
+
   if (buffer_write_u16(bfp, querytype_to_num(q->qtype)))
     return -1;
   if (buffer_write_u16(bfp, 1))
@@ -569,10 +648,10 @@ int dns_record_read(BytePacketBuffer *bfp, DnsRecord *out) {
   return 0;
 }
 
-int dns_record_write(DnsRecord *r, BytePacketBuffer *bfp) {
+int dns_record_write(DnsRecord *r, BytePacketBuffer *bfp, CompressTable *ct) {
   switch (r->kind) {
   case DNS_RECORD_A:
-    if (buffer_write_qname(bfp, r->domain))
+    if (buffer_write_qname_compressed(bfp, r->domain, ct))
       return -1;
     if (buffer_write_u16(bfp, 1))
       return -1;
@@ -595,7 +674,7 @@ int dns_record_write(DnsRecord *r, BytePacketBuffer *bfp) {
   case DNS_RECORD_NS:
   case DNS_RECORD_CNAME: {
     uint16_t type_num = (r->kind == DNS_RECORD_NS) ? 2 : 5;
-    if (buffer_write_qname(bfp, r->domain))
+    if (buffer_write_qname_compressed(bfp, r->domain, ct))
       return -1;
     if (buffer_write_u16(bfp, type_num))
       return -1;
@@ -607,7 +686,7 @@ int dns_record_write(DnsRecord *r, BytePacketBuffer *bfp) {
     size_t pos = bfp->pos;
     if (buffer_write_u16(bfp, 0))
       return -1;
-    if (buffer_write_qname(bfp, r->host))
+    if (buffer_write_qname_compressed(bfp, r->host, ct))
       return -1;
 
     uint16_t size = (uint16_t)(bfp->pos - (pos + 2));
@@ -617,7 +696,7 @@ int dns_record_write(DnsRecord *r, BytePacketBuffer *bfp) {
   }
 
   case DNS_RECORD_MX: {
-    if (buffer_write_qname(bfp, r->domain))
+    if (buffer_write_qname_compressed(bfp, r->domain, ct))
       return -1;
     if (buffer_write_u16(bfp, 15))
       return -1;
@@ -631,7 +710,7 @@ int dns_record_write(DnsRecord *r, BytePacketBuffer *bfp) {
       return -1;
     if (buffer_write_u16(bfp, r->priority))
       return -1;
-    if (buffer_write_qname(bfp, r->host))
+    if (buffer_write_qname_compressed(bfp, r->host, ct))
       return -1;
 
     uint16_t size = (uint16_t)(bfp->pos - (pos + 2));
@@ -641,7 +720,7 @@ int dns_record_write(DnsRecord *r, BytePacketBuffer *bfp) {
   }
 
   case DNS_RECORD_AAAA: {
-    if (buffer_write_qname(bfp, r->domain))
+    if (buffer_write_qname_compressed(bfp, r->domain, ct))
       return -1;
     if (buffer_write_u16(bfp, 28))
       return -1;
@@ -802,20 +881,23 @@ int dns_packet_write(DnsPacket *pkt, BytePacketBuffer *bfp) {
   if (dns_header_write(&pkt->header, bfp))
     return -1;
 
+  CompressTable ct;
+  compress_table_init(&ct);
+
   for (size_t i = 0; i < pkt->questions_count; i++)
-    if (dns_question_write(&pkt->questions[i], bfp))
+    if (dns_question_write(&pkt->questions[i], bfp, &ct))
       return -1;
 
   for (size_t i = 0; i < pkt->answers_count; i++)
-    if (dns_record_write(&pkt->answers[i], bfp))
+    if (dns_record_write(&pkt->answers[i], bfp, &ct))
       return -1;
 
   for (size_t i = 0; i < pkt->authorities_count; i++)
-    if (dns_record_write(&pkt->authorities[i], bfp))
+    if (dns_record_write(&pkt->authorities[i], bfp, &ct))
       return -1;
 
   for (size_t i = 0; i < pkt->resources_count; i++)
-    if (dns_record_write(&pkt->resources[i], bfp))
+    if (dns_record_write(&pkt->resources[i], bfp, &ct))
       return -1;
 
   return 0;
