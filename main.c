@@ -432,7 +432,8 @@ typedef enum {
   QUERY_NS = 2,
   QUERY_CNAME = 3,
   QUERY_MX = 4,
-  QUERY_AAAA = 5
+  QUERY_AAAA = 5,
+  QUERY_SOA = 6,
 } QueryTypeKind;
 
 typedef struct {
@@ -452,6 +453,8 @@ static const char *querytype_to_str(QueryType qt) {
     return "MX";
   case QUERY_AAAA:
     return "AAAA";
+  case QUERY_SOA:
+    return "SOA";
   default:
     return "UNKNOWN";
   }
@@ -471,6 +474,10 @@ QueryType querytype_from_num(uint16_t num) {
   case 5:
     qt.kind = QUERY_CNAME;
     qt.num = num;
+    break;
+  case 6:
+    qt.kind = QUERY_SOA;
+    qt.kind = num;
     break;
   case 15:
     qt.kind = QUERY_MX;
@@ -493,7 +500,6 @@ uint16_t querytype_to_num(QueryType qt) { return qt.num; }
 /*
  * DNSQuestion
  */
-
 typedef struct {
   char name[QNAME_MAX];
   QueryType qtype;
@@ -545,6 +551,7 @@ typedef enum {
   DNS_RECORD_CNAME = 5,
   DNS_RECORD_MX = 15,
   DNS_RECORD_AAAA = 28,
+  DNS_RECORD_SOA = 6,
 } DnsRecordKind;
 
 typedef struct {
@@ -559,6 +566,15 @@ typedef struct {
 
   uint16_t qtype;    /* UNKNOWN */
   uint16_t data_len; /* UNKNOWN */
+
+  // SOA field
+  char mname[QNAME_MAX]; /* Primary Namespace */
+  char rname[QNAME_MAX]; /* responsible mailbox */
+  uint32_t serial;
+  uint32_t refresh;
+  uint32_t retry;
+  uint32_t expire;
+  uint32_t minimum; /* negative caching TTL */
 } DnsRecord;
 
 int dns_record_read(BytePacketBuffer *bfp, DnsRecord *out) {
@@ -594,6 +610,7 @@ int dns_record_read(BytePacketBuffer *bfp, DnsRecord *out) {
     out->addr[3] = (raw_addr >> 0) & 0xFF;
     break;
   }
+
   case QUERY_AAAA: {
     uint32_t r1, r2, r3, r4;
     if (buffer_read_u32(bfp, &r1))
@@ -616,6 +633,7 @@ int dns_record_read(BytePacketBuffer *bfp, DnsRecord *out) {
     out->addr6[7] = (r4 >> 0) & 0xFFFF;
     break;
   }
+
   case QUERY_NS:
     out->kind = DNS_RECORD_NS;
     if (buffer_read_qname(bfp, out->host, QNAME_MAX))
@@ -635,6 +653,25 @@ int dns_record_read(BytePacketBuffer *bfp, DnsRecord *out) {
     if (buffer_read_qname(bfp, out->host, QNAME_MAX))
       return -1;
     break;
+
+  case QUERY_SOA:
+    out->kind = DNS_RECORD_SOA;
+    if (buffer_read_qname(bfp, out->mname, QNAME_MAX))
+      return -1;
+    if (buffer_read_qname(bfp, out->rname, QNAME_MAX))
+      return -1;
+    if (buffer_read_u32(bfp, &out->serial))
+      return -1;
+    if (buffer_read_u32(bfp, &out->refresh))
+      return -1;
+    if (buffer_read_u32(bfp, &out->retry))
+      return -1;
+    if (buffer_read_u32(bfp, &out->expire))
+      return -1;
+    if (buffer_read_u32(bfp, &out->minimum))
+      return -1;
+    break;
+
   default:
     if (buffer_step(bfp, data_len))
       return -1;
@@ -736,6 +773,39 @@ int dns_record_write(DnsRecord *r, BytePacketBuffer *bfp, CompressTable *ct) {
     }
     break;
   }
+
+  case DNS_RECORD_SOA:
+    if (buffer_write_qname(bfp, r->domain))
+      return -1;
+    if (buffer_write_u16(bfp, 6))
+      return -1;
+    if (buffer_write_u16(bfp, 1))
+      return -1;
+    if (buffer_write_u32(bfp, r->ttl))
+      return -1;
+
+    size_t soa_pos = bfp->pos;
+    if (buffer_write_u16(bfp, 0))
+      return -1;
+    if (buffer_write_qname(bfp, r->mname))
+      return -1;
+    if (buffer_write_qname(bfp, r->rname))
+      return -1;
+    if (buffer_write_u32(bfp, r->serial))
+      return -1;
+    if (buffer_write_u32(bfp, r->refresh))
+      return -1;
+    if (buffer_write_u32(bfp, r->retry))
+      return -1;
+    if (buffer_write_u32(bfp, r->expire))
+      return -1;
+    if (buffer_write_u32(bfp, r->minimum))
+      return -1;
+
+    uint16_t soa_size = (uint16_t)(bfp->pos - (soa_pos + 2));
+    if (buffer_set_u16(bfp, soa_pos, soa_size))
+      return -1;
+    break;
 
   default:
     printf("Skipping UNKNOWN record for domain: %s\n", r->domain);
@@ -903,10 +973,17 @@ int dns_packet_write(DnsPacket *pkt, BytePacketBuffer *bfp) {
   return 0;
 }
 
+uint32_t dns_packet_get_soa_minimun(DnsPacket *pkt, uint32_t default_ttl) {
+  for (size_t i = 0; i < pkt->authorities_count; i++) {
+    if (pkt->authorities[i].kind == DNS_RECORD_SOA)
+      return pkt->authorities[i].minimum;
+  }
+  return default_ttl;
+}
+
 /*
  * print helpers
  */
-
 static void print_record(DnsRecord *r) {
   switch (r->kind) {
   case DNS_RECORD_A:
@@ -950,6 +1027,19 @@ static void print_record(DnsRecord *r) {
     printf("    priority: %u,\n", r->priority);
     printf("    host: \"%s\",\n", r->host);
     printf("    ttl: %u\n", r->ttl);
+    printf("}\n");
+    break;
+
+  case DNS_RECORD_SOA:
+    printf("SOA {\n");
+    printf("    domain:  \"%s\",\n", r->domain);
+    printf("    mname:   \"%s\",\n", r->mname);
+    printf("    rname:   \"%s\",\n", r->rname);
+    printf("    serial:  %u,\n", r->serial);
+    printf("    refresh: %u,\n", r->refresh);
+    printf("    retry:   %u,\n", r->retry);
+    printf("    expire:  %u,\n", r->expire);
+    printf("    minimum: %u\n", r->minimum);
     printf("}\n");
     break;
 
@@ -1081,6 +1171,11 @@ int lookup(const char *qname, QueryType qtype, uint8_t server_ip[4],
   return dns_packet_from_buffer(&res, out);
 }
 
+// currently im just adding forward declaration for this function
+// TODO: REFRECTOR this monster
+void cache_store_negative(const char *qname, QueryType qtype, uint32_t ttl,
+                          DnsPacket *response);
+
 int recursive_lookup(const char *qname, QueryType qtype, DnsPacket *out) {
   // starting with *a.root-servers.net*
   uint8_t ns[4] = {198, 41, 0, 4};
@@ -1105,6 +1200,8 @@ int recursive_lookup(const char *qname, QueryType qtype, DnsPacket *out) {
 
     // if we got NXDOMAIN, that means the name doenst exists
     if (response.header.rescode == NXDOMAIN) {
+      uint32_t neg_ttl = dns_packet_get_soa_minimun(&response, 300);
+      cache_store_negative(qname, qtype, neg_ttl, &response);
       *out = response;
       return 0;
     }
@@ -1162,6 +1259,9 @@ typedef struct {
   size_t records_count;
   time_t expires_at;
   int valid;
+  int is_negative; // 1 -> NXDOMAIN, 0 -> NORMAL
+  DnsRecord soa;
+  int has_soa;
 } CacheEntry;
 
 static CacheEntry cache[CACHE_SIZE];
@@ -1207,6 +1307,7 @@ void cache_store(const char *qname, QueryType qtype, DnsPacket *pkt) {
   entry->qtype = qtype;
   entry->records_count = 0;
   entry->valid = 1;
+  entry->is_negative = 1;
 
   // store ttl of first record for expiry
   entry->expires_at = time(NULL) + pkt->answers[0].ttl;
@@ -1215,6 +1316,29 @@ void cache_store(const char *qname, QueryType qtype, DnsPacket *pkt) {
     entry->records[entry->records_count++] = pkt->answers[i];
 }
 
+void cache_store_negative(const char *qname, QueryType qtype, uint32_t ttl,
+                          DnsPacket *response) {
+  size_t slot = cache_find_slot();
+  CacheEntry *e = &cache[slot];
+
+  strncpy(e->qname, qname, QNAME_MAX - 1);
+  e->qname[QNAME_MAX - 1] = '\0';
+  e->qtype = qtype;
+  e->records_count = 0;
+  e->expires_at = time(NULL) + ttl;
+  e->valid = 1;
+  e->is_negative = 1;
+  e->has_soa = 0;
+
+  /* store the SOA from authorities */
+  for (size_t i = 0; i < response->authorities_count; i++) {
+    if (response->authorities[i].kind == DNS_RECORD_SOA) {
+      e->soa = response->authorities[i];
+      e->has_soa = 1;
+      break;
+    }
+  }
+}
 int cache_lookup(const char *qname, QueryType qtype, DnsPacket *out) {
   time_t now = time(NULL);
 
@@ -1234,6 +1358,25 @@ int cache_lookup(const char *qname, QueryType qtype, DnsPacket *out) {
     if (entry->expires_at <= now) {
       entry->valid = 0;
       return 0;
+    }
+    // if negative cache hit, domain doesnt exit
+    if (entry->is_negative) {
+      dns_packet_init(out);
+      out->header.rescode = NXDOMAIN;
+      out->header.response = 1;
+      out->header.recursion_available = 1;
+
+      if (entry->has_soa) {
+        out->authorities = calloc(1, sizeof(DnsRecord));
+        if (out->authorities) {
+          out->authorities[0] = entry->soa;
+          uint32_t remaining = (uint32_t)(entry->expires_at - time(NULL));
+          out->authorities[0].ttl = remaining;
+          out->authorities_count = 1;
+        }
+      }
+
+      return 1;
     }
 
     // build DnsPacket from cached records
