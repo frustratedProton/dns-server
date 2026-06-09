@@ -45,7 +45,7 @@ void cache_store(const char *qname, QueryType qtype, DnsPacket *pkt) {
   entry->qtype = qtype;
   entry->records_count = 0;
   entry->valid = 1;
-  entry->is_negative = 0;
+  entry->is_negative = 1;
 
   // store ttl of first record for expiry
   entry->expires_at = time(NULL) + pkt->answers[0].ttl;
